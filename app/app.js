@@ -34,8 +34,6 @@ function el(tag, attrs = {}, text) {
 }
 
 function markAcked(row, reply) {
-  const button = row.querySelector('[data-testid="ack"]');
-  if (button) button.remove();
   if (!row.querySelector('[data-testid="acked"]')) {
     const mark = el('span', { 'data-testid': 'acked', class: 'acked', title: `acked ${reply.ackedAt}` }, 'acked');
     row.querySelector('.action').append(mark);
@@ -43,42 +41,94 @@ function markAcked(row, reply) {
   row.classList.add('is-acked');
 }
 
-// SCHED-4511 (R2): Ack on a row acks that row's incident, by id, never by position.
-async function onAck(event) {
-  const button = event.currentTarget;
-  const row = button.closest('[data-testid="incident-row"]');
-  const id = row.dataset.id;
-  button.disabled = true;
-  button.textContent = 'acking…';
+// SCHED-4515 (R2, changed by product on 2026-11-12): Ack left the row. A row opens its incident panel; the
+// panel names the incident, and its Ack acks the incident the panel names. New rows still land live at the
+// top (R1), so a click that lands on a row that just moved opens the wrong panel, and the panel says so
+// before anything is acked.
+const panel = document.querySelector('[data-testid="incident-panel"]');
+const panelId = panel.querySelector('.panel-id');
+const panelWhat = panel.querySelector('.panel-what');
+const panelTime = panel.querySelector('.panel-time');
+const panelAck = panel.querySelector('[data-testid="panel-ack"]');
+const panelState = panel.querySelector('.panel-state');
+let openId = null;
+const incidentsById = new Map();
+
+function showPanel(id) {
+  const i = incidentsById.get(id);
+  if (!i) return;
+  openId = id;
+  for (const [rid, row] of rows) row.classList.toggle('is-open', rid === id);
+  panel.dataset.id = id;
+  panelId.textContent = id;
+  panelWhat.textContent = `${i.severity} · ${i.service} · ${i.region} · ${i.summary}`;
+  panelTime.setAttribute('datetime', i.openedAt);
+  panelTime.textContent = `opened ${localTime(i.openedAt)}`;
+  const reply = acked.get(id);
+  panelAck.hidden = Boolean(reply);
+  panelAck.disabled = false;
+  panelAck.textContent = `Ack ${id}`;
+  panelState.hidden = !reply;
+  panelState.textContent = reply ? `acked ${localTime(reply.ackedAt)}` : '';
+  panel.hidden = false;
+}
+
+function closePanel() {
+  openId = null;
+  panel.hidden = true;
+  delete panel.dataset.id;
+  for (const row of rows.values()) row.classList.remove('is-open');
+}
+
+async function onPanelAck() {
+  const id = panel.dataset.id; // the incident the panel names, never a position in the list
+  if (!id || acked.has(id)) return;
+  panelAck.disabled = true;
+  panelAck.textContent = `acking ${id}…`;
   try {
     const reply = await ack(id);
     acked.set(id, reply);
-    markAcked(row, reply);
+    const row = rows.get(id);
+    if (row) markAcked(row, reply);
   } catch (err) {
     console.error(err);
-    button.disabled = false;
-    button.textContent = 'Ack';
     showStatus(`Ack failed for ${id}. Try again.`);
   }
+  if (openId === id) showPanel(id);
+}
+panelAck.addEventListener('click', onPanelAck);
+panel.querySelector('.panel-close').addEventListener('click', closePanel);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && openId) closePanel();
+});
+
+function onRowOpen(event) {
+  if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+  if (event.type === 'keydown') event.preventDefault();
+  showPanel(event.currentTarget.dataset.id);
 }
 
 function buildRow(i) {
-  const row = el('li', { 'data-testid': 'incident-row', 'data-id': i.id, class: `row ${i.severity}` });
+  const row = el('li', {
+    'data-testid': 'incident-row',
+    'data-id': i.id,
+    class: `row ${i.severity}`,
+    role: 'button',
+    tabindex: '0',
+    'aria-controls': 'incident-panel',
+    'aria-label': `Open ${i.id}`,
+  });
   row.append(
     el('span', { class: 'id' }, i.id),
     el('span', { class: 'sev' }, i.severity),
     el('span', { class: 'what' }, `${i.service} · ${i.region} · ${i.summary}`),
     el('time', { datetime: i.openedAt, title: i.openedAt }, localTime(i.openedAt)),
+    el('span', { class: 'action' }),
   );
-  const action = el('span', { class: 'action' });
-  row.append(action);
-  if (acked.has(i.id)) {
-    markAcked(row, acked.get(i.id));
-  } else {
-    const button = el('button', { type: 'button', 'data-testid': 'ack', class: 'ack' }, 'Ack');
-    button.addEventListener('click', onAck);
-    action.append(button);
-  }
+  if (acked.has(i.id)) markAcked(row, acked.get(i.id));
+  if (openId === i.id) row.classList.add('is-open');
+  row.addEventListener('click', onRowOpen);
+  row.addEventListener('keydown', onRowOpen);
   return row;
 }
 
@@ -97,6 +147,7 @@ function render(incidents) {
   let prev = null;
   for (const i of incidents) {
     seen.add(i.id);
+    incidentsById.set(i.id, i);
     let row = rows.get(i.id);
     if (row) updateRow(row, i);
     else {

@@ -1,36 +1,62 @@
-// Deterministic check of the plan's hooks against a board URL. Usage: node check.mjs <url> [--ack]
+// Deterministic check of the plan's hooks against a board URL. Usage: node scripts/check.mjs <url>
+// Checks: loader then rows; build sha in meta and footer; no Ack in rows; a row opens a panel that names it;
+// the panel's Ack acks the incident it names; the acked mark survives refreshes; no row removed by a refresh;
+// local time in two zones.
 import { chromium } from 'playwright';
 const url = process.argv[2];
-const doAck = process.argv.includes('--ack');
 const browser = await chromium.launch();
-for (const [locale, timezoneId] of [['de-DE', 'Europe/Berlin'], ['en-NZ', 'Pacific/Auckland']]) {
-  const page = await (await browser.newContext({ locale, timezoneId })).newPage();
-  const logs = [];
-  page.on('console', (m) => logs.push(m.text()));
-  page.on('pageerror', (e) => logs.push('PAGEERROR ' + e.message));
+let failed = 0;
+const ok = (cond, what) => {
+  console.log(`${cond ? 'ok  ' : 'FAIL'} ${what}`);
+  if (!cond) failed++;
+};
+for (const [locale, timezoneId, doAck] of [['de-DE', 'Europe/Berlin', true], ['en-NZ', 'Pacific/Auckland', false]]) {
+  const context = await browser.newContext({ locale, timezoneId, viewport: { width: 1280, height: 800 } });
+  await context.addInitScript(() => {
+    window.__rowsRemoved = 0;
+    new MutationObserver((rs) => {
+      for (const r of rs) for (const n of r.removedNodes) if (n.nodeType === 1 && n.matches?.('[data-testid="incident-row"]')) window.__rowsRemoved++;
+    }).observe(document, { childList: true, subtree: true });
+  });
+  const page = await context.newPage();
+  const errors = [];
+  const acks = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
+  page.on('response', async (r) => r.url().includes('/api/ack') && acks.push(await r.json().catch(() => null)));
+  console.log(`\n[${locale} ${timezoneId}]`);
   await page.goto(url);
-  const loaderAtOpen = await page.locator('[data-testid="loader"]').count();
+  ok((await page.locator('[data-testid="loader"]').count()) === 1, 'loader on open');
   await page.waitForSelector('[data-testid="incident-row"]');
-  const loaderAfter = await page.locator('[data-testid="loader"]').count();
+  ok((await page.locator('[data-testid="loader"]').count()) === 0, 'loader gone once rows load');
   const meta = await page.getAttribute('meta[name="build"]', 'content');
-  const footer = await page.textContent('[data-testid="build-sha"]');
-  const rows = await page.$$eval('[data-testid="incident-row"]', (rs) =>
-    rs.map((r) => ({ id: r.dataset.id, t: r.querySelector('time').textContent, dt: r.querySelector('time').getAttribute('datetime') })));
-  console.log(`\n[${locale} ${timezoneId}] loader open=${loaderAtOpen} after=${loaderAfter} meta=${meta} footer=${footer} rows=${rows.length}`);
-  console.log(rows.slice(0, 2), rows.at(-1));
-  if (doAck && locale === 'de-DE') {
-    const row = page.locator('[data-testid="incident-row"]').nth(1);
+  ok(meta && meta === (await page.textContent('[data-testid="build-sha"]')), `build sha in meta and footer (${meta})`);
+  ok((await page.locator('[data-testid="incident-row"] [data-testid="ack"]').count()) === 0, 'no Ack button in rows');
+  ok(!(await page.locator('[data-testid="incident-panel"]').isVisible()), 'panel closed on open');
+  const t = await page.locator('[data-testid="incident-row"][data-id="INC-9614"] time').textContent().catch(() => null);
+  console.log(`     INC-9614 shows "${t}"`);
+  if (doAck) {
+    const row = page.locator('[data-testid="incident-row"]').nth(2);
     const id = await row.getAttribute('data-id');
-    // hold a reference to the node before refreshes
-    const handle = await row.elementHandle();
-    await row.locator('[data-testid="ack"]').click();
+    await row.click();
+    const panel = page.locator('[data-testid="incident-panel"]');
+    ok((await panel.isVisible()) && (await panel.innerText()).includes(id), `row click opens a panel naming ${id}`);
+    await page.locator('[data-testid="panel-ack"]').click();
     await page.waitForSelector(`[data-testid="incident-row"][data-id="${id}"] [data-testid="acked"]`);
-    await page.waitForTimeout(5000); // two+ refreshes
-    const stillAcked = await page.locator(`[data-testid="incident-row"][data-id="${id}"] [data-testid="acked"]`).count();
-    const sameNode = await handle.evaluate((n) => n.isConnected);
-    const acks = logs.filter((l) => l.startsWith('ack'));
-    console.log(`acked ${id}: mark after 5 s=${stillAcked}, same node=${sameNode}, ack logs=${acks.length}`);
+    ok(acks.at(-1)?.id === id, `panel Ack acked ${acks.at(-1)?.id}, expected ${id}`);
+    ok(!(await page.locator('[data-testid="panel-ack"]').isVisible()), 'panel Ack gone after ack');
+    await page.keyboard.press('Escape');
+    ok(!(await panel.isVisible()), 'Escape closes the panel');
+    const other = page.locator('[data-testid="incident-row"]').nth(3);
+    await other.focus();
+    await page.keyboard.press('Enter');
+    ok((await panel.innerText()).includes(await other.getAttribute('data-id')), 'Enter on a row opens its panel');
+    await page.waitForTimeout(16000);
+    ok((await page.locator(`[data-testid="incident-row"][data-id="${id}"] [data-testid="acked"]`).count()) === 1, 'acked mark kept after 16 s of refreshes');
+    ok((await page.evaluate(() => window.__rowsRemoved)) === 0, 'no row removed by refreshes');
   }
-  console.log('errors:', logs.filter((l) => /error|PAGEERROR/i.test(l)));
+  ok(errors.length === 0, `no page errors ${errors.length ? JSON.stringify(errors) : ''}`);
+  await context.close();
 }
 await browser.close();
+process.exit(failed ? 1 : 0);
